@@ -1,0 +1,12 @@
+.env
+.build/
+.state/
+backups/
+*.log
+*.sql
+*.tar.gz
+*.zip
+.DS_Store
+
+__pycache__/
+*.pyc
