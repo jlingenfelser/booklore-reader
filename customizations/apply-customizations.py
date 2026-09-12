@@ -79,16 +79,23 @@ popup_ts_file.write_text(popup_ts)
 
 popup_html_file = path("booklore-ui/src/app/features/readers/ebook-reader/shared/selection-popup.component.html")
 popup_html = popup_html_file.read_text()
-popup_html = replace_once(
-    popup_html,
-    "    <div class=\"divider\"></div>\n    <div class=\"annotation-container\">",
-    "    <div class=\"divider\"></div>\n"
-    "    <button class=\"action-btn\" (click)=\"onReadAloud()\" title=\"Read aloud\">\n"
-    "      <app-reader-icon name=\"play\" [size]=\"16\"></app-reader-icon>\n"
-    "    </button>\n\n"
-    "    <div class=\"divider\"></div>\n    <div class=\"annotation-container\">",
-    "annotation container in selection popup",
-)
+if '(click)="onReadAloud()"' not in popup_html:
+    popup_html, count = re.subn(
+        r'(?P<indent>[ \t]*)<div class="divider"></div>\s*'
+        r'(?P=indent)<div class="annotation-container">',
+        lambda match: (
+            f'{match.group("indent")}<div class="divider"></div>\n'
+            f'{match.group("indent")}<button class="action-btn" (click)="onReadAloud()" title="Read aloud">\n'
+            f'{match.group("indent")}  <app-reader-icon name="play" [size]="16"></app-reader-icon>\n'
+            f'{match.group("indent")}</button>\n\n'
+            f'{match.group("indent")}<div class="divider"></div>\n'
+            f'{match.group("indent")}<div class="annotation-container">'
+        ),
+        popup_html,
+        count=1,
+    )
+    if count != 1:
+        raise SystemExit("Upstream changed: could not find annotation container in selection popup")
 popup_html_file.write_text(popup_html)
 
 # ---------------------------------------------------------------------------
