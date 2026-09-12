@@ -54,6 +54,19 @@ pkg_file.write_text(json.dumps(pkg, indent=2) + "\n")
 )
 
 # ---------------------------------------------------------------------------
+# Low-memory production build defaults for the 2 GB deployment target.
+# ---------------------------------------------------------------------------
+dockerfile = path("Dockerfile")
+docker_src = dockerfile.read_text()
+docker_src = replace_once(
+    docker_src,
+    "RUN npm run build --configuration=production",
+    'ENV NG_BUILD_MAX_WORKERS=1\nENV NODE_OPTIONS="--max-old-space-size=1536"\nRUN npm run build -- --configuration=production',
+    "Angular production build command",
+)
+dockerfile.write_text(docker_src)
+
+# ---------------------------------------------------------------------------
 # Selection popup: add Read Aloud action
 # ---------------------------------------------------------------------------
 popup_ts_file = path("booklore-ui/src/app/features/readers/ebook-reader/shared/selection-popup.component.ts")
@@ -99,6 +112,109 @@ if '(click)="onReadAloud()"' not in popup_html:
 popup_html_file.write_text(popup_html)
 
 # ---------------------------------------------------------------------------
+# Reader event service: mobile tap-to-start TTS anchor picking.
+# ---------------------------------------------------------------------------
+event_file = path("booklore-ui/src/app/features/readers/ebook-reader/core/event.service.ts")
+event_src = event_file.read_text()
+event_src = replace_once(
+    event_src,
+    "  type: 'load' | 'relocate' | 'error' | 'middle-single-tap' | 'draw-annotation' | 'show-annotation' | 'text-selected' | 'toggle-fullscreen' | 'toggle-shortcuts-help' | 'escape-pressed' | 'go-first-section' | 'go-last-section' | 'toggle-toc' | 'toggle-search' | 'toggle-notes';",
+    "  type: 'load' | 'relocate' | 'error' | 'middle-single-tap' | 'draw-annotation' | 'show-annotation' | 'text-selected' | 'tts-anchor-picked' | 'toggle-fullscreen' | 'toggle-shortcuts-help' | 'escape-pressed' | 'go-first-section' | 'go-last-section' | 'toggle-toc' | 'toggle-search' | 'toggle-notes';",
+    "ViewEvent type union for TTS tap anchor",
+)
+event_src = replace_once(
+    event_src,
+    "  private lastTouchTime = 0;",
+    "  private lastTouchTime = 0;\n  private ttsTapAnchorArmed = false;",
+    "event-service lastTouchTime state",
+)
+event_src = replace_once(
+    event_src,
+    "  emit(event: ViewEvent): void {\n    this.eventSubject.next(event);\n  }",
+    "  emit(event: ViewEvent): void {\n"
+    "    this.eventSubject.next(event);\n"
+    "  }\n\n"
+    "  armTtsTapAnchor(): void {\n"
+    "    this.ttsTapAnchorArmed = true;\n"
+    "  }\n\n"
+    "  cancelTtsTapAnchor(): void {\n"
+    "    this.ttsTapAnchorArmed = false;\n"
+    "  }",
+    "event-service emit()",
+)
+event_src = replace_once(
+    event_src,
+    "    doc.addEventListener('click', (event: MouseEvent) => {\n"
+    "      // Ignore synthesized mouse events that follow touch events",
+    "    doc.addEventListener('click', (event: MouseEvent) => {\n"
+    "      if (this.ttsTapAnchorArmed) {\n"
+    "        event.preventDefault();\n"
+    "        event.stopPropagation();\n"
+    "        this.pickTtsAnchorFromPoint(doc, event.clientX, event.clientY);\n"
+    "        return;\n"
+    "      }\n\n"
+    "      // Ignore synthesized mouse events that follow touch events",
+    "iframe click handler for TTS tap anchor",
+)
+event_src = replace_once(
+    event_src,
+    "    this.lastTouchTime = touchEndTime;\n\n"
+    "    const selection = doc.defaultView?.getSelection();",
+    "    this.lastTouchTime = touchEndTime;\n\n"
+    "    if (this.ttsTapAnchorArmed && event.changedTouches.length === 1) {\n"
+    "      const touch = event.changedTouches[0];\n"
+    "      event.preventDefault();\n"
+    "      event.stopPropagation();\n"
+    "      this.isTextSelectionInProgress = false;\n"
+    "      this.pickTtsAnchorFromPoint(doc, touch.clientX, touch.clientY);\n"
+    "      return;\n"
+    "    }\n\n"
+    "    const selection = doc.defaultView?.getSelection();",
+    "touchend TTS tap anchor handler",
+)
+anchor_pick_methods = r'''
+  private pickTtsAnchorFromPoint(doc: Document, clientX: number, clientY: number): void {
+    const anyDoc = doc as any;
+    let range: Range | null = null;
+
+    if (typeof anyDoc.caretRangeFromPoint === 'function') {
+      range = anyDoc.caretRangeFromPoint(clientX, clientY) as Range | null;
+    } else if (typeof anyDoc.caretPositionFromPoint === 'function') {
+      const position = anyDoc.caretPositionFromPoint(clientX, clientY);
+      if (position?.offsetNode) {
+        range = doc.createRange();
+        try {
+          range.setStart(position.offsetNode, position.offset);
+          range.collapse(true);
+        } catch {
+          range = null;
+        }
+      }
+    }
+
+    if (!range) return;
+
+    const contents = this.viewCallbacks?.getContents();
+    if (!contents?.length) return;
+    const content = contents.find(item => item.doc === doc) ?? contents[0];
+    const cfi = this.viewCallbacks?.getCFI(content.index, range);
+    if (!cfi) return;
+
+    this.ttsTapAnchorArmed = false;
+    this.eventSubject.next({
+      type: 'tts-anchor-picked',
+      detail: {text: '', cfi, range, index: content.index}
+    });
+  }
+'''
+if "private pickTtsAnchorFromPoint(" not in event_src:
+    marker = "  private handleSelectionEnd(doc: Document): void {\n"
+    if marker not in event_src:
+        raise SystemExit("Upstream changed: event-service handleSelectionEnd() not found")
+    event_src = event_src.replace(marker, anchor_pick_methods + "\n" + marker, 1)
+event_file.write_text(event_src)
+
+# ---------------------------------------------------------------------------
 # Foliate view manager: create sentence-aware chunks, each with its own CFI.
 # ---------------------------------------------------------------------------
 view_file = path("booklore-ui/src/app/features/readers/ebook-reader/core/view-manager.service.ts")
@@ -137,6 +253,15 @@ view_methods = r'''
     return this.view?.book?.sections?.length
       ?? this.view?.book?.spine?.length
       ?? 0;
+  }
+
+
+  armTtsTapAnchor(): void {
+    this.eventService.armTtsTapAnchor();
+  }
+
+  cancelTtsTapAnchor(): void {
+    this.eventService.cancelTtsTapAnchor();
   }
 
   private buildTtsChunks(
@@ -267,6 +392,7 @@ tts_state = r'''
   ttsState: 'idle' | 'loading' | 'playing' | 'paused' | 'error' = 'idle';
   ttsError = '';
   ttsIsGenerating = false;
+  ttsTapToStartArmed = false;
   private ttsAnchorSelection: any = null;
   private ttsAudio: HTMLAudioElement | null = null;
   private ttsObjectUrl: string | null = null;
@@ -302,6 +428,23 @@ reader = replace_once(
 )
 reader = replace_once(
     reader,
+    "          case 'text-selected':\n"
+    "            this.ttsAnchorSelection = event.detail;\n"
+    "            this.selectionService.handleTextSelected(event.detail, event.popupPosition);\n"
+    "            break;",
+    "          case 'text-selected':\n"
+    "            this.ttsAnchorSelection = event.detail;\n"
+    "            this.selectionService.handleTextSelected(event.detail, event.popupPosition);\n"
+    "            break;\n"
+    "          case 'tts-anchor-picked':\n"
+    "            this.ttsTapToStartArmed = false;\n"
+    "            this.ttsAnchorSelection = event.detail;\n"
+    "            void this.readAloud();\n"
+    "            break;",
+    "TTS tap anchor event handler",
+)
+reader = replace_once(
+    reader,
     "  handleSelectionAction(action: TextSelectionAction): void {\n"
     "    if (action.type === 'note') {\n"
     "      this.noteService.openNewNoteDialog();\n"
@@ -323,6 +466,23 @@ reader = replace_once(
 )
 
 methods = r'''
+  toggleTtsTapToStart(): void {
+    if (this.ttsTapToStartArmed) {
+      this.ttsTapToStartArmed = false;
+      this.viewManager.cancelTtsTapAnchor();
+      return;
+    }
+
+    if (this.ttsState !== 'idle' && this.ttsState !== 'error') {
+      this.stopTts();
+    }
+    this.ttsError = '';
+    this.selectionService.handleAction({type: 'dismiss'});
+    this.viewManager.clearSelection();
+    this.ttsTapToStartArmed = true;
+    this.viewManager.armTtsTapAnchor();
+  }
+
   private loadReaderTtsSettings(): void {
     try {
       const saved = JSON.parse(localStorage.getItem(this.ttsSettingsKey) || 'null');
@@ -394,6 +554,8 @@ methods = r'''
   }
 
   stopTts(): void {
+    this.ttsTapToStartArmed = false;
+    this.viewManager.cancelTtsTapAnchor();
     this.ttsSessionId += 1;
     this.ttsAbortController?.abort();
     this.ttsAbortController = null;
@@ -658,6 +820,21 @@ reader_ts_file.write_text(reader)
 reader_html_file = path("booklore-ui/src/app/features/readers/ebook-reader/ebook-reader.component.html")
 reader_html = reader_html_file.read_text()
 controls = r'''
+  @if (ttsState === 'idle' || ttsState === 'error') {
+    <div class="tts-mobile-start-control"
+         [class.tts-header-visible]="headerVisible"
+         (click)="$event.stopPropagation()">
+      <button class="tts-mobile-start-button" type="button"
+              [class.tts-mobile-start-armed]="ttsTapToStartArmed"
+              (click)="toggleTtsTapToStart()"
+              [attr.title]="ttsTapToStartArmed ? 'Cancel tap-to-start' : 'Read from here'"
+              [attr.aria-label]="ttsTapToStartArmed ? 'Cancel choosing reading start' : 'Choose where reading starts'">
+        <span class="tts-mobile-start-icon">{{ ttsTapToStartArmed ? '✕' : '▶' }}</span>
+        <span>{{ ttsTapToStartArmed ? 'Tap text…' : 'Read from here' }}</span>
+      </button>
+    </div>
+  }
+
   @if (ttsState === 'loading' || ttsState === 'playing' || ttsState === 'paused' || ttsIsGenerating) {
     <div class="tts-reader-controls"
          [class.tts-header-visible]="headerVisible"
@@ -692,6 +869,39 @@ reader_scss_file = path("booklore-ui/src/app/features/readers/ebook-reader/ebook
 reader_scss = reader_scss_file.read_text()
 reader_css = r'''
 /* BookLore Reader custom TTS controls */
+.tts-mobile-start-control {
+  display: none;
+  position: fixed;
+  top: .65rem;
+  right: .65rem;
+  z-index: 13050;
+  transition: top .25s ease-out;
+}
+.tts-mobile-start-control.tts-header-visible { top: calc(36px + .65rem); }
+.tts-mobile-start-button {
+  min-height: 2.65rem;
+  padding: 0 .85rem;
+  border: 1px solid rgba(255,255,255,.22);
+  border-radius: .7rem;
+  background: rgba(24,24,27,.88);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+  font: 600 .86rem/1 system-ui, sans-serif;
+  box-shadow: 0 4px 18px rgba(0,0,0,.25);
+  backdrop-filter: blur(8px);
+  touch-action: manipulation;
+}
+.tts-mobile-start-button.tts-mobile-start-armed {
+  background: #fff;
+  color: #18181b;
+}
+.tts-mobile-start-icon { font: 700 .9rem/1 system-ui, sans-serif; }
+@media (hover: none) and (pointer: coarse) {
+  .tts-mobile-start-control { display: flex; }
+}
+
 .tts-reader-controls {
   position: fixed;
   top: 1rem;
@@ -738,6 +948,7 @@ reader_css = r'''
 }
 @keyframes tts-spin { to { transform: rotate(360deg); } }
 @media (max-width: 640px) {
+  .tts-mobile-start-control { display: flex; }
   .tts-reader-controls { top: .65rem; right: .65rem; }
   .tts-reader-controls.tts-header-visible { top: calc(36px + .65rem); }
 }
