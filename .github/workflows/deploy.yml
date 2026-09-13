@@ -3,7 +3,7 @@ name: Deploy to Linode
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, master]
 
 concurrency:
   group: booklore-production
@@ -27,12 +27,12 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -p "${PORT:-22}" -H "$HOST" >> ~/.ssh/known_hosts
 
-      - name: Deploy current main branch
+      - name: Deploy triggering branch
         env:
           HOST: ${{ secrets.LINODE_HOST }}
           USER: ${{ secrets.LINODE_USER }}
           PORT: ${{ secrets.LINODE_SSH_PORT }}
           APP_DIR: ${{ secrets.LINODE_APP_DIR }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          ssh -p "${PORT:-22}" "${USER:-booklore}@${HOST}" \
-            "cd '${APP_DIR:-/opt/booklore-reader}' && DEPLOY_BRANCH=main ./scripts/update.sh"
+          ssh -p "${PORT:-22}" "${USER:-booklore}@${HOST}"             "cd '${APP_DIR:-/opt/booklore-reader}' && DEPLOY_BRANCH='${BRANCH}' ./scripts/update.sh"

@@ -10,3 +10,5 @@ backups/
 
 __pycache__/
 *.pyc
+
+.repo-hardening-backup/

@@ -64,6 +64,12 @@ docker_src = replace_once(
     'ENV NG_BUILD_MAX_WORKERS=1\nENV NODE_OPTIONS="--max-old-space-size=1536"\nRUN npm run build -- --configuration=production',
     "Angular production build command",
 )
+docker_src = replace_once(
+    docker_src,
+    "RUN gradle clean build -x test --no-daemon --parallel",
+    "RUN gradle clean build -x test --no-daemon --max-workers=1",
+    "Gradle production build command",
+)
 dockerfile.write_text(docker_src)
 
 # ---------------------------------------------------------------------------

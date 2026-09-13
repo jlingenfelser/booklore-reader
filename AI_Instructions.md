@@ -1,198 +1,151 @@
 # AI Instructions — BookLore Reader Custom
 
-Use this file to bring another AI coding assistant up to speed before making changes.
+Use this file to bring another AI coding assistant up to speed before modifying the project.
 
 ## Project purpose
 
-This repository builds and deploys a customized BookLore ebook server/reader. It deliberately does not vendor BookLore's full upstream tree. `scripts/prepare-source.sh` fetches the release pinned in `config/upstream.env`, then `customizations/apply-customizations.py` modifies that clean source before Docker builds it.
+This repository builds and deploys a customized BookLore ebook server/reader. It does not vendor the full upstream BookLore tree. `scripts/prepare-source.sh` fetches the release pinned in `config/upstream.env`; `customizations/apply-customizations.py` transforms that clean source before Docker builds it.
 
-The project should remain easy to deploy to Linode and easy to rebase onto newer BookLore releases.
+The production target is a fresh Ubuntu 24.04 Linode, currently sized at 2 GB RAM. GitHub is the code source of truth; `/srv/booklore-reader` on the Linode is the persistent state source of truth.
 
 ## Non-negotiable design constraints
 
-1. **Persistent state must remain outside Git.** Default state root: `/srv/booklore-reader`.
-2. **Never commit `.env`, DB credentials, books, database files, voice caches, Caddy certificates, or backups.**
-3. **Keep BookLore upstream pinned.** Do not switch production to a moving `latest`/`develop` source.
-4. **Prefer guarded customizations over copying/replacing whole upstream files.** If an upstream anchor changes, fail loudly with `Upstream changed:`.
-5. **Only Caddy should expose public ports.** MariaDB/Piper/BookLore stay on the internal Docker network.
-6. **Browser Local TTS means inference occurs in the web browser.** It must not require a client-side container, Python daemon, or localhost API.
-7. **Paste-to-EPUB must bypass BookDrop.** Direct upload destination IDs are URL query parameters, not multipart fields.
+1. Persistent state remains outside Git under `/srv/booklore-reader`.
+2. Never commit `.env`, DB credentials, books, database files, voice caches, Caddy certificates, or backups.
+3. Keep BookLore upstream pinned; do not point production at a moving `latest`/`develop` branch.
+4. Prefer guarded source transforms; fail loudly with `Upstream changed:` when an upstream anchor changes.
+5. Only Caddy exposes public app ports. MariaDB, Piper, and BookLore remain internal.
+6. Browser Local TTS means inference happens in the browser; do not require a client-side container/daemon/API.
+7. Paste-to-EPUB must bypass BookDrop. `libraryId` and `pathId` belong in URL query parameters, not multipart fields.
+8. Production provisioning is fresh from GitHub; do not migrate the local development instance unless explicitly requested.
+9. Deployment scripts must not assume `main`; `main` and `master` are both supported. Use the current branch unless `DEPLOY_BRANCH` is explicitly set.
+10. The 2 GB production target requires low-memory builds: one Angular worker, Node heap limit, Gradle `--max-workers=1`, live stack stopped during image build, and swap available.
+11. `/books` write permissions are functional requirements. Host paths manually created as root must be reassigned to `APP_USER_ID:APP_GROUP_ID`.
 
 ## Current upstream pin
 
-Read `config/upstream.env`. The initial packaged pin is BookLore `v2.3.1`.
+Read `config/upstream.env`. The packaged baseline is BookLore `v2.3.1` unless that file has been deliberately updated.
 
-## Custom features
+## TTS behavior
 
-### TTS selection anchor
+### Desktop selection anchor
 
 - User selects any amount of EPUB text.
-- The selection's first character is the start position.
-- The selection length does not limit spoken text.
-- Read Aloud is an action in BookLore's text-selection popup.
+- The first character of the selection is the start position.
+- Selection length does not limit spoken text.
+- `Read aloud` appears in BookLore's text-selection popup.
 
-### TTS queue
+### Mobile tap-to-start
 
-- Default chunk target: ~650 characters, sentence-aware.
-- Each chunk has text + EPUB CFI + section index.
-- Generate current chunk, play it, prefetch one or more ahead.
-- Pause pauses current HTMLAudioElement.
-- Stop aborts network generation, clears queue, revokes object URLs, and invalidates the session ID.
-- Move the reader to a chunk's CFI when that chunk starts playing, not when it merely enters the prefetch queue.
-- This keeps BookLore's saved progress and visible page near the spoken location.
-- Continue across EPUB sections/chapters.
+- Mobile/touch view has a top `Read from here` button while TTS is idle/error.
+- Tapping it arms `Tap text…` mode.
+- The next touch on EPUB text is converted to a collapsed range/caret and BookLore CFI/index.
+- That exact location feeds the same continuous TTS queue as desktop selection.
+- The consumed tap should not also turn the page/toggle the reader UI.
+- Tapping the armed control again cancels.
 
-### TTS controls
+### Queue and playback
 
-- Top-right vertical stack.
-- Pause/Resume button, then Stop button.
-- Loading spinner below the buttons so generation does not move the transport buttons.
-- When BookLore's reader header becomes visible (`headerVisible`), slide the control stack downward by the header height (~36 px) using the same ~0.25s timing.
+- Default chunks are ~650 characters and sentence-aware.
+- Each chunk carries text + EPUB CFI + section index.
+- Prefetch future chunks, but move the reader only when a chunk starts playing.
+- Continue across sections/chapters until paused/stopped.
+- Pause/Resume and Stop are top-right; loading indicator stays below transport controls.
+- When BookLore's header becomes visible, controls move down by the same header height.
 
 ### Reader settings
 
-`More Settings -> Reader` provides:
+`More Settings -> Reader` contains sentence pause, chunk size, queue-ahead count, speed, and Local mode. Settings key: `bookloreReaderTtsSettings` in `localStorage`.
 
-- sentence pause
-- chunk size
-- queue-ahead count
-- speech speed
-- Local mode
+Preferred save semantics: sliders update visually during input and persist on release/change; toggles/reset persist immediately; no separate Save button; changed settings should normally affect the next TTS session.
 
-Settings key: `bookloreReaderTtsSettings` in `localStorage`.
+### Server Piper
 
-Preferred save semantics:
-
-- range sliders: commit on `change` / slider release
-- Local mode: immediate
-- Reset: immediate
-- no separate Save button
-- new settings apply to the next TTS session rather than mutating a currently speaking queue unexpectedly
-
-### Server TTS
-
-Caddy routes `/tts/*` to the Piper container.
-
-Voice:
-
-- `en_US-libritts_r-medium`
-- `speaker_id: 0`
-- LibriTTS speaker label: `3922`
-
-The custom Piper image patches the HTTP server to accept JSON `sentence_silence` and uses:
+Caddy routes `/tts/*` to Piper. Voice is `en_US-libritts_r-medium`, speaker 0 (LibriTTS label 3922). The HTTP patch accepts `sentence_silence`; 16-bit silence must use an even byte count:
 
 ```python
 bytes(int(sample_rate * sentence_silence) * 2)
 ```
 
-for silence. Do not revert to calculating the byte count first with `int(sample_rate * sentence_silence * 2)`; that can create an odd byte count at some sample rates and corrupt following 16-bit PCM into static.
+### Browser Local Piper
 
-### Browser Local TTS
+Uses `piper-tts-web`/ONNX/WASM in-browser. Do not replace this with a local daemon. Browser speed can use `HTMLAudioElement.playbackRate` with pitch preservation.
 
-Uses `piper-tts-web` and `PiperWebEngine` in the browser. Copy the library's ONNX/Piper/worker runtime assets into the Angular public tree during `prepare-source.sh`.
+## Paste to EPUB
 
-Keep the same LibriTTS-R voice/speaker. Browser mode may implement configured sentence gaps by generating sentence audio and concatenating PCM with explicit silence. Speech speed may use HTML audio `playbackRate` with pitch preservation.
+The Support BookLore shortcut is replaced with Paste-to-EPUB. It accepts raw text, title, optional author, library/path, builds an EPUB with JSZip, and uploads directly.
 
-### Paste to EPUB
-
-The main topbar Support BookLore heart is replaced by a file-edit/Paste-to-EPUB shortcut. Mobile equivalent is replaced too.
-
-The page accepts arbitrary raw text, title, optional author, destination library/path, creates an EPUB in-browser with JSZip, and uploads it directly.
-
-Correct upload contract:
+Correct API contract:
 
 ```text
 POST /api/v1/files/upload?libraryId=<libraryId>&pathId=<pathId>
 ```
 
-Multipart body contains only:
+Multipart body contains only the file. Historical bug: putting destination IDs in `FormData` routed generated EPUBs through BookDrop. Never reintroduce it.
+
+## Low-memory build requirements
+
+`customizations/apply-customizations.py` patches the upstream Dockerfile to use:
 
 ```text
-file=<generated EPUB>
+NG_BUILD_MAX_WORKERS=1
+NODE_OPTIONS=--max-old-space-size=1536
+Gradle --max-workers=1 (not --parallel)
 ```
 
-IMPORTANT HISTORICAL BUG: the first implementation sent `libraryId` and `pathId` as FormData fields. The upload appeared successful but the file surfaced in BookDrop Review; trying to finalize could fail as “already there.” Do not reintroduce that implementation.
+`scripts/deploy.sh` prepares source, then stops the live stack for the image build. It builds BookLore and Piper separately. On build failure after stopping the stack, it attempts to restart the previous containers.
 
-## BookDrop distinction
+The provisioner creates `/swapfile` at 2 GB by default (`SWAP_SIZE_GB=2`). Do not respond to memory pressure by casually increasing Node/Gradle concurrency.
 
-BookDrop is BookLore's staging/review workflow for watched-folder imports. It is useful for review, metadata work, and finalizing imported files. It is **not** the desired path for Paste-to-EPUB.
+Historical production failure: building with the live stack running exhausted 2 GB RAM and swap badly enough for the kernel to OOM-kill Java and system services, causing SSH banner timeouts and journald failures.
+
+## Linode firewall model
+
+UFW and Linode Cloud Firewall are separate. Provisioning configures UFW, but cannot change the user's Cloud Firewall without Linode API credentials. The public-interface firewall must allow TCP 22/80/443. Caddy ACME `Timeout during connect` is a strong signal to check that external firewall.
+
+## Persistent storage and permissions
+
+Host `/srv/booklore-reader/books` is mounted as container `/books`.
+
+The application uses `APP_USER_ID`/`APP_GROUP_ID` from `.env`. A folder that exists but is owned `root:root` and not writable can make `POST /api/v1/files/upload` return HTTP 500 with `Error reading files from path`.
+
+Use `scripts/create-book-folder.sh` to create folders and `sudo scripts/fix-books-permissions.sh` to repair the entire books tree. The definitive test is a `docker exec -u "$APP_USER_ID:$APP_GROUP_ID" ... mkdir /books/...` write test.
 
 ## Deployment lifecycle
 
 ### Fresh server
 
-`scripts/provision-linode.sh`:
+`scripts/provision-linode.sh` installs dependencies, configures UFW/fail2ban, creates the service user/state tree/swapfile, clones the repo's default branch (or `DEPLOY_BRANCH`), creates `.env`, and deploys.
 
-- Ubuntu 24.04
-- installs Docker Engine/Compose from Docker's apt repository
-- creates `booklore` user
-- enables UFW/fail2ban
-- clones repo to `/opt/booklore-reader`
-- creates `/srv/booklore-reader`
-- generates `.env`
-- runs deploy
-
-### Deploy
+### Normal deploy
 
 `scripts/deploy.sh`:
 
-- uses existing `.env` or initializes it
-- makes a DB backup when possible
-- calls `prepare-source.sh`
-- builds BookLore + Piper
-- starts Compose stack
+1. creates `.env` if missing;
+2. creates state directories;
+3. backs up MariaDB when available;
+4. prepares clean pinned upstream source;
+5. stops the live stack when `STOP_STACK_FOR_BUILD` is enabled (default);
+6. builds BookLore, then Piper;
+7. starts the stack;
+8. attempts recovery if the build fails after stopping the stack.
 
-### Normal update
+### Update
 
-`scripts/update.sh` fast-forwards from GitHub and calls deploy.
+`scripts/update.sh` fast-forwards the current branch by default, or an explicit `DEPLOY_BRANCH`, then invokes deploy.
 
-### Upstream BookLore upgrade
+### Upstream upgrade
 
-Use `scripts/update-upstream.sh <tag>` to change only the pin, run a local/test deploy, repair any customization anchors, test all custom functionality, then commit the new pin.
+Use `scripts/update-upstream.sh <tag>`, prepare/build, repair any failed transform anchors, test all custom behavior, and commit the pin only after validation.
 
-## How to modify this project safely
+## Safe modification process
 
-When changing a customization:
-
-1. Inspect the exact upstream source at the currently pinned ref.
+1. Inspect exact upstream source at the pinned ref.
 2. Edit `customizations/apply-customizations.py`, not `.build/booklore-src`.
 3. Run `./scripts/prepare-source.sh`.
-4. Build/test with `./scripts/deploy.sh` or Docker build locally.
-5. Do not commit `.build/`.
-6. Update docs if architecture or operation changed.
+4. Run `./scripts/validate.sh`.
+5. Test build/deploy.
+6. Never commit `.build/`.
+7. Update docs when behavior/operations change.
 
-When upgrading upstream, test at least:
-
-- app boot/login
-- library browsing
-- EPUB reader and progress
-- selection Read Aloud
-- several queued TTS chunks
-- pause/resume/stop + loading spinner position
-- cross-chapter continuation
-- server TTS
-- browser Local TTS
-- Reader settings persistence
-- Paste-to-EPUB direct-to-library behavior
-- ordinary BookDrop workflow still unaffected
-
-## Files to inspect first
-
-- `README.md`
-- `config/upstream.env`
-- `customizations/apply-customizations.py`
-- `scripts/prepare-source.sh`
-- `docker-compose.yml`
-- `piper/patch-http-server.py`
-- `docs/ARCHITECTURE.md`
-- `docs/UPGRADING.md`
-
-## Priorities
-
-When choosing between convenience and maintainability, favor:
-
-1. keeping user data safe
-2. reproducible builds
-3. explicit pinned versions
-4. minimal manual Linode configuration
-5. preserving upstream BookLore behavior outside the intentionally customized areas
+Test at least: app login, library browsing, EPUB reader/progress, desktop Read Aloud, mobile Read from here, queued chunks, pause/resume/stop, cross-chapter continuation, server Piper, browser Local Piper, settings persistence, Paste-to-EPUB direct upload, BookDrop unaffected, and writable `/books` paths.
