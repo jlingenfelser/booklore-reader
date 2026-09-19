@@ -15,3 +15,12 @@ Production-hardening pass based on the first fresh Linode deployment.
 - Added Linode Cloud Firewall/ACME troubleshooting.
 - Added safe library-folder creation and `/books` permission-repair helpers.
 - Added operations runbook covering uploads, permissions, PDF compression, swap/OOM recovery, logs, backups, and mobile TTS.
+
+### Mobile reader fixes
+
+- Update the continuous-scroll restoration anchor immediately to avoid restoring
+  stale positions during layout changes; preserve explicit navigation anchors.
+- Treat only stationary taps as Read from here selections.
+- Keep the screen awake throughout an active TTS session, including pauses, and
+  release the lock on Stop, completion, error, or reader teardown.
+- Match the pinned upstream Dockerfile's cache-mounted Gradle build command.

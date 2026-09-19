@@ -66,11 +66,44 @@ docker_src = replace_once(
 )
 docker_src = replace_once(
     docker_src,
-    "RUN gradle clean build -x test --no-daemon --parallel",
-    "RUN gradle clean build -x test --no-daemon --max-workers=1",
+    "gradle clean build -x test --no-daemon --parallel",
+    "gradle clean build -x test --no-daemon --max-workers=1",
     "Gradle production build command",
 )
 dockerfile.write_text(docker_src)
+
+# Keep the scroll anchor current before mobile resize/content expansion callbacks.
+paginator_file = path("booklore-ui/src/assets/foliate/paginator.js")
+paginator = paginator_file.read_text()
+paginator = replace_once(
+    paginator,
+    "    #justAnchored = false",
+    "    #lastAnchorOffset = 0\n    #justAnchored = false",
+    "paginator scroll anchor state",
+)
+paginator = replace_once(
+    paginator,
+    "        this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))",
+    """        this.#container.addEventListener('scroll', () => {
+            // A user scroll must replace the old CFI before resize/expand can restore it.
+            // Preserve exact navigation anchors for their own generated scroll events.
+            if (this.scrolled && this.#view &&
+                this.#container[this.scrollProp] !== this.#lastAnchorOffset) {
+                this.#anchor = this.#getVisibleRange()
+                this.#lastAnchorOffset = this.#container[this.scrollProp]
+                this.#justAnchored = false
+            }
+            this.dispatchEvent(new Event('scroll'))
+        })""",
+    "paginator immediate scroll anchor update",
+)
+paginator = replace_once(
+    paginator,
+    "    #afterScroll(reason) {\n        const range = this.#getVisibleRange()",
+    "    #afterScroll(reason) {\n        this.#lastAnchorOffset = this.#container[this.scrollProp]\n        const range = this.#getVisibleRange()",
+    "paginator programmatic scroll position",
+)
+paginator_file.write_text(paginator)
 
 # ---------------------------------------------------------------------------
 # Selection popup: add Read Aloud action
@@ -167,7 +200,10 @@ event_src = replace_once(
     "    this.lastTouchTime = touchEndTime;\n\n"
     "    const selection = doc.defaultView?.getSelection();",
     "    this.lastTouchTime = touchEndTime;\n\n"
-    "    if (this.ttsTapAnchorArmed && event.changedTouches.length === 1) {\n"
+    "    if (this.ttsTapAnchorArmed && event.changedTouches.length === 1 &&\n"
+    "        touchDuration < this.LONG_HOLD_THRESHOLD_MS &&\n"
+    "        Math.abs(event.changedTouches[0].clientX - this.touchStartX) < 10 &&\n"
+    "        Math.abs(event.changedTouches[0].clientY - this.touchStartY) < 10) {\n"
     "      const touch = event.changedTouches[0];\n"
     "      event.preventDefault();\n"
     "      event.stopPropagation();\n"
@@ -400,6 +436,9 @@ tts_state = r'''
   ttsIsGenerating = false;
   ttsTapToStartArmed = false;
   private ttsAnchorSelection: any = null;
+  private ttsWakeLock: WakeLockSentinel | null = null;
+  private ttsWakeLockRequest: Promise<void> | null = null;
+  private ttsKeepAwake = false;
   private ttsAudio: HTMLAudioElement | null = null;
   private ttsObjectUrl: string | null = null;
   private ttsAbortController: AbortController | null = null;
@@ -472,6 +511,46 @@ reader = replace_once(
 )
 
 methods = r'''
+  @HostListener('document:visibilitychange')
+  onTtsVisibilityChanged(): void {
+    if (document.visibilityState === 'visible') void this.requestTtsWakeLock();
+  }
+
+  private async requestTtsWakeLock(): Promise<void> {
+    if (!this.ttsKeepAwake || document.visibilityState !== 'visible' ||
+        !('wakeLock' in navigator) || this.ttsWakeLock) return;
+    if (this.ttsWakeLockRequest) {
+      await this.ttsWakeLockRequest;
+      if (this.ttsKeepAwake && !this.ttsWakeLock) void this.requestTtsWakeLock();
+      return;
+    }
+    const sessionId = this.ttsSessionId;
+    this.ttsWakeLockRequest = (async () => {
+      try {
+        const lock = await navigator.wakeLock.request('screen');
+        if (!this.ttsKeepAwake || sessionId !== this.ttsSessionId) {
+          await lock.release();
+          return;
+        }
+        this.ttsWakeLock = lock;
+        lock.addEventListener('release', () => {
+          if (this.ttsWakeLock === lock) this.ttsWakeLock = null;
+        });
+      } catch (error) {
+        console.warn('Could not keep the screen awake:', error);
+      }
+    })();
+    try { await this.ttsWakeLockRequest; }
+    finally { this.ttsWakeLockRequest = null; }
+  }
+
+  private releaseTtsWakeLock(): void {
+    this.ttsKeepAwake = false;
+    const lock = this.ttsWakeLock;
+    this.ttsWakeLock = null;
+    if (lock) void lock.release().catch(error => console.warn('Could not release screen wake lock:', error));
+  }
+
   toggleTtsTapToStart(): void {
     if (this.ttsTapToStartArmed) {
       this.ttsTapToStartArmed = false;
@@ -520,6 +599,7 @@ methods = r'''
     this.ttsError = '';
 
     if (!this.ttsAnchorSelection?.range) {
+      this.releaseTtsWakeLock();
       this.ttsState = 'error';
       this.ttsError = 'Select text where you want reading to begin.';
       return;
@@ -527,6 +607,7 @@ methods = r'''
 
     const chunks = this.viewManager.getTtsChunksFromSelectionStart(this.ttsAnchorSelection, this.ttsChunkChars);
     if (!chunks.length) {
+      this.releaseTtsWakeLock();
       this.ttsState = 'error';
       this.ttsError = 'No readable text was found after that position.';
       return;
@@ -536,6 +617,8 @@ methods = r'''
     this.ttsSectionIndex = this.ttsAnchorSelection.index;
     this.ttsPendingChunks = chunks;
     this.ttsState = 'loading';
+    this.ttsKeepAwake = true;
+    void this.requestTtsWakeLock();
 
     try {
       await this.prefetchTtsQueue(sessionId, 1);
@@ -543,6 +626,7 @@ methods = r'''
     } catch (error) {
       if (sessionId !== this.ttsSessionId) return;
       this.ttsIsGenerating = false;
+      this.releaseTtsWakeLock();
       this.ttsState = 'error';
       this.ttsError = error instanceof Error ? error.message : 'Text-to-speech failed.';
     }
@@ -551,8 +635,22 @@ methods = r'''
   async toggleTtsPause(): Promise<void> {
     if (!this.ttsAudio) return;
     if (this.ttsAudio.paused) {
-      await this.ttsAudio.play();
-      this.ttsState = 'playing';
+      const audio = this.ttsAudio;
+      const sessionId = this.ttsSessionId;
+      try {
+        await audio.play();
+        if (sessionId !== this.ttsSessionId) {
+          audio.pause();
+          return;
+        }
+        this.ttsState = 'playing';
+        void this.requestTtsWakeLock();
+      } catch (error) {
+        if (sessionId !== this.ttsSessionId) return;
+        this.releaseTtsWakeLock();
+        this.ttsState = 'error';
+        this.ttsError = error instanceof Error ? error.message : 'Could not resume playback.';
+      }
     } else {
       this.ttsAudio.pause();
       this.ttsState = 'paused';
@@ -560,6 +658,7 @@ methods = r'''
   }
 
   stopTts(): void {
+    this.releaseTtsWakeLock();
     this.ttsTapToStartArmed = false;
     this.viewManager.cancelTtsTapAnchor();
     this.ttsSessionId += 1;
@@ -745,17 +844,23 @@ methods = r'''
       };
       audio.onerror = () => {
         if (sessionId !== this.ttsSessionId) return;
+        this.releaseTtsWakeLock();
         this.ttsState = 'error';
         this.ttsError = 'Generated audio could not be played.';
         this.cleanupTtsAudio();
       };
       await audio.play();
+      if (sessionId !== this.ttsSessionId) {
+        audio.pause();
+        return;
+      }
       this.ttsState = 'playing';
       void this.prefetchTtsQueue(sessionId, this.ttsPrefetchChunks).catch(error => {
         if (sessionId === this.ttsSessionId) console.error('TTS prefetch failed:', error);
       });
     } catch (error) {
       if (sessionId !== this.ttsSessionId) return;
+      this.releaseTtsWakeLock();
       this.ttsState = 'error';
       this.ttsError = error instanceof Error ? error.message : 'Text-to-speech failed.';
       this.cleanupTtsAudio();
@@ -782,6 +887,7 @@ methods = r'''
   }
 
   private finishTtsPlayback(): void {
+    this.releaseTtsWakeLock();
     this.cleanupTtsAudio();
     for (const item of this.ttsAudioQueue) URL.revokeObjectURL(item.url);
     this.ttsAudioQueue = [];
