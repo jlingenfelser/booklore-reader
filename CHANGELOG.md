@@ -18,6 +18,10 @@ Production-hardening pass based on the first fresh Linode deployment.
 
 ### Mobile reader fixes
 
+- Avoid restoring the reading position when mobile browser toolbars change the
+  viewport height in continuous-scroll mode. Preserve pending native scrolling
+  when layout callbacks run before the scroll event, in both directions.
+
 - Update the continuous-scroll restoration anchor immediately to avoid restoring
   stale positions during layout changes; preserve explicit navigation anchors.
 - Treat only stationary taps as Read from here selections.

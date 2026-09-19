@@ -103,6 +103,36 @@ paginator = replace_once(
     "    #afterScroll(reason) {\n        this.#lastAnchorOffset = this.#container[this.scrollProp]\n        const range = this.#getVisibleRange()",
     "paginator programmatic scroll position",
 )
+# Mobile browser chrome changes the viewport along the scrolling axis. This
+# changes how much text is visible, not its layout, and must not restore a CFI.
+paginator = replace_once(
+    paginator,
+    "    #observer = new ResizeObserver(() => this.render())",
+    """    #resizeInlineSize
+    #observer = new ResizeObserver(() => {
+        const { width, height } = this.#container.getBoundingClientRect()
+        const inlineSize = this.#vertical ? height : width
+        const unchanged = inlineSize === this.#resizeInlineSize
+        this.#resizeInlineSize = inlineSize
+        if (this.scrolled && unchanged) return
+        this.render()
+    })""",
+    "paginator viewport resize handling",
+)
+# Native scrolling can advance before its scroll event is delivered. Never
+# let an expansion/resize callback restore the previous position in that gap.
+paginator = replace_once(
+    paginator,
+    "    async #scrollToAnchor(anchor, reason = 'anchor') {\n        this.#anchor = anchor",
+    """    async #scrollToAnchor(anchor, reason = 'anchor') {
+        if (reason === 'anchor' && this.scrolled && this.#view &&
+            this.#container[this.scrollProp] !== this.#lastAnchorOffset) {
+            this.#afterScroll('scroll')
+            return
+        }
+        this.#anchor = anchor""",
+    "paginator pending native scroll preservation",
+)
 paginator_file.write_text(paginator)
 
 # ---------------------------------------------------------------------------

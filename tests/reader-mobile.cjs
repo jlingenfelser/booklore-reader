@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const ts = require(process.argv[2] || '../.build/booklore-src/booklore-ui/node_modules/typescript');
-const root = '.build/booklore-src/booklore-ui/';
+const root = process.env.READER_UI_ROOT || '.build/booklore-src/booklore-ui/';
 const reader = fs.readFileSync(root + 'src/app/features/readers/ebook-reader/ebook-reader.component.ts', 'utf8');
 const methods = reader.slice(reader.indexOf("  @HostListener('document:visibilitychange')"), reader.indexOf('  toggleTtsTapToStart():'))
   .replace(/  @HostListener\([^\n]+\)\n/g, '');
@@ -80,5 +80,63 @@ function lock() {
   paginated.scrolled = false;
   paginated.move(100);
   assert.equal(paginated.anchor, 'navigation', 'paginated behavior stays unchanged');
+  const resizeStart = paginator.indexOf('    #resizeInlineSize');
+  const resizeEnd = paginator.indexOf('    #top', resizeStart);
+  const restoreStart = paginator.indexOf("    async #scrollToAnchor(anchor, reason = 'anchor')");
+  const restoreEnd = paginator.indexOf('    #getVisibleRange()', restoreStart);
+  const Layout = vm.runInNewContext(`class Layout {
+    #container = {scrollTop: 200, scrollLeft: 0,
+      getBoundingClientRect: () => this.bounds};
+    #vertical = false; #view = {}; #lastAnchorOffset = 200; #anchor = 'saved';
+    bounds = {width: 390, height: 700}; scrolled = true; scrollProp = 'scrollTop';
+    renders = 0; restores = []; relocations = [];
+    ${paginator.slice(resizeStart, resizeEnd)}
+    ${paginator.slice(restoreStart, restoreEnd)}
+    render() { this.renders++; }
+    #afterScroll(reason) {
+      this.relocations.push(reason);
+      this.#lastAnchorOffset = this.#container[this.scrollProp];
+    }
+    #scrollToRect(rect, reason) { this.restores.push(reason); }
+    #scrollTo(offset, reason) { this.restores.push(reason); }
+    #scrollToPage(page, reason) { this.restores.push(reason); }
+    resize(width, height) { this.bounds = {width, height}; this.#observer.callback(); }
+    move(offset) { this.#container[this.scrollProp] = offset; }
+    restore(reason) { return this.#scrollToAnchor(0.5, reason); }
+    vertical() { this.#vertical = true; this.scrollProp = 'scrollLeft'; }
+  }; Layout`, {
+    ResizeObserver: class { constructor(callback) { this.callback = callback; } },
+    uncollapse: () => null,
+  });
+  const layout = new Layout();
+  layout.resize(390, 700);
+  layout.resize(390, 780);
+  layout.resize(390, 700);
+  assert.equal(layout.renders, 1, 'browser toolbar height changes must not restore position');
+  layout.resize(780, 390);
+  assert.equal(layout.renders, 2, 'orientation/width changes must still reflow');
+  layout.scrolled = false;
+  layout.resize(780, 400);
+  assert.equal(layout.renders, 3, 'paginated mode must still render on height changes');
+  const vertical = new Layout();
+  vertical.vertical();
+  vertical.resize(390, 700);
+  vertical.resize(450, 700);
+  assert.equal(vertical.renders, 1, 'vertical text uses height as its layout axis');
+  vertical.resize(450, 800);
+  assert.equal(vertical.renders, 2);
+  for (const offset of [100, 300]) {
+    const pending = new Layout();
+    pending.move(offset);
+    await pending.restore();
+    assert.equal(pending.restores.length, 0, 'pending native scroll must win in either direction');
+    assert.equal(pending.relocations.length, 1, 'pending position must update reading progress');
+    await pending.restore('navigation');
+    await pending.restore('selection');
+    assert.equal(pending.restores.length, 2, 'explicit navigation and selection must still work');
+  }
+  const stationary = new Layout();
+  await stationary.restore();
+  assert.equal(stationary.restores.length, 1, 'stationary content expansion retains restoration');
   console.log('Mobile reader regression checks passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });
